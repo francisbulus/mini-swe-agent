@@ -980,3 +980,405 @@ These are available in Jinja2 templates (system prompt, etc.).
 | Use case | Development/trusted | SWE-bench/untrusted code |
 
 The protocol design means you can swap `LocalEnvironment` for `DockerEnvironment` with zero code changes — just different config.
+
+---
+
+## Real Use Case: SWE-bench with Docker (Annotated End-to-End)
+
+This is the primary use case for mini-swe-agent: solving real GitHub issues from the SWE-bench benchmark inside Docker containers.
+
+### The Command
+
+```bash
+mini-swebench -i django__django-11099 -m anthropic/claude-sonnet-4-5-20250929
+```
+
+### Step 1: CLI Parses Arguments
+
+File: `swebench_single.py:42-53`
+
+```
+$ mini-swebench -i django__django-11099 -m anthropic/claude-sonnet-4-5-20250929
+
+Parses args:
+  subset = "lite"
+  instance_spec = "django__django-11099"
+  model_name = "anthropic/claude-sonnet-4-5-20250929"
+```
+
+### Step 2: Load SWE-bench Instance from Hugging Face
+
+File: `swebench_single.py:56-64`
+
+```python
+instances = load_dataset("princeton-nlp/SWE-Bench_Lite", split="dev")
+instance = instances["django__django-11099"]
+```
+
+The instance is a dict containing:
+
+```python
+{
+    "instance_id": "django__django-11099",
+    "problem_statement": "UsernameValidator allows trailing newline...",
+    "repo": "django/django",
+    "base_commit": "abc123...",    # Exact commit to check out
+    "patch": "diff --git...",       # Gold solution (hidden from agent)
+    "test_patch": "diff --git...",  # Tests that validate the fix
+    "FAIL_TO_PASS": "[\"test_...\"]",  # Tests that must go from fail → pass
+    "PASS_TO_PASS": "[\"test_...\"]",  # Tests that must stay passing
+    ...
+}
+```
+
+### Step 3: Build Configuration
+
+File: `swebench_single.py:66-77`
+
+Loads and merges `swebench.yaml` + CLI overrides:
+
+```yaml
+agent:
+  system_template: "You are a helpful assistant..."
+  instance_template: "<pr_description>{{task}}</pr_description>..."
+  step_limit: 250       # Max 250 LLM calls
+  cost_limit: 3.0       # Max $3 per instance
+
+environment:
+  environment_class: docker   # ◄── Key: use Docker
+  cwd: "/testbed"             # ◄── Working dir inside container
+  timeout: 60
+
+model:
+  model_name: "anthropic/claude-sonnet-4-5-20250929"
+  model_kwargs:
+    temperature: 0.0
+```
+
+### Step 4: Create Docker Environment
+
+File: `swebench.py:92-106` → `docker.py:46-99`
+
+```
+get_sb_environment(config, instance):
+
+  4a. Compute Docker image name from instance_id:
+      "django__django-11099"
+       → "swebench/sweb.eval.x86_64.django_1776_django-11099:latest"
+      (SWE-bench provides pre-built images with repo + all dependencies)
+
+  4b. DockerEnvironment.__init__() calls _start_container():
+
+      $ docker run -d \
+          --name minisweagent-a1b2c3d4 \
+          -w /testbed \
+          --rm \
+          swebench/sweb.eval.x86_64.django_1776_django-11099:latest \
+          sleep 2h
+
+      Returns: container_id = "abc123def456..."
+
+  Container now running with:
+    - Django repo checked out at the exact base_commit
+    - All dependencies pre-installed
+    - Working directory: /testbed
+```
+
+### Step 5: Create Model + Agent
+
+File: `swebench_single.py:79-84`
+
+```python
+model = LitellmModel(model_name="anthropic/claude-sonnet-4-5-20250929")
+
+agent = InteractiveAgent(
+    model,
+    env,              # ◄── The Docker environment
+    system_template="You are a helpful assistant...",
+    instance_template="<pr_description>{{task}}...",
+    step_limit=250,
+    cost_limit=3.0
+)
+```
+
+### Step 6: Start Agent Run
+
+File: `default.py:77-97`
+
+```python
+agent.run(instance["problem_statement"])
+```
+
+Renders templates and initializes messages:
+
+```python
+messages = [
+    {"role": "system",  "content": "You are a helpful assistant..."},
+    {"role": "user",    "content": "<pr_description>UsernameValidator allows..."}
+]
+```
+
+Enters the main loop: `while True: self.step()`
+
+### Step 7: Agent Loop (Multiple Iterations)
+
+Each iteration: `query()` → LLM API call → `execute_actions()` → docker exec
+
+```
+Iteration 1: LLM explores the codebase
+  LLM:  "I'll start by exploring the structure."
+  cmd:  find /testbed -name '*.py' | head -20
+  exec: docker exec -w /testbed abc123 bash -lc "find /testbed -name '*.py' | head -20"
+  out:  /testbed/django/contrib/auth/validators.py ...
+
+Iteration 2: LLM reads the relevant file
+  LLM:  "Let me look at the validator file."
+  cmd:  cat /testbed/django/contrib/auth/validators.py
+  exec: docker exec -w /testbed abc123 bash -lc "cat ..."
+  out:  class UsernameValidator: regex = r'^[\w.@+-]+$' ...
+
+Iteration 3: LLM creates reproduction script
+  cmd:  cat <<'EOF' > /testbed/reproduce.py ...
+
+Iteration 4: LLM runs reproduction
+  cmd:  cd /testbed && python reproduce.py
+
+Iteration 5: LLM edits the source
+  cmd:  sed -i "s/regex = r'^[\\w.@+-]+\$'/regex = r'^[\\w.@+-]+\\Z'/" validators.py
+
+Iteration 6: LLM verifies fix
+  cmd:  cd /testbed && python reproduce.py
+
+... (all commands run via docker exec into the SAME container)
+```
+
+### Step 8: Task Completion
+
+File: `docker.py:140-151`
+
+LLM creates a patch and submits:
+
+```
+LLM runs: git diff -- django/contrib/auth/validators.py > patch.txt
+LLM runs: echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt
+```
+
+Docker exec runs the command, output is:
+
+```
+COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT           ◄── Magic string
+diff --git a/django/contrib/auth/validators.py b/...
+--- a/django/contrib/auth/validators.py
++++ b/django/contrib/auth/validators.py
+@@ -10,7 +10,7 @@
+-    regex = r'^[\w.@+-]+$'
++    regex = r'^[\w.@+-]+\Z'
+```
+
+`_check_finished()` sees the magic string → raises `Submitted(patch)`
+→ Agent catches it → adds exit message → loop breaks
+
+### Step 9: Agent Returns Result
+
+```python
+return {"exit_status": "Submitted", "submission": "diff --git a/django/..."}
+```
+
+### Step 10: Cleanup
+
+```
+- Trajectory saved to JSON file (every command + output recorded)
+- env object goes out of scope → __del__() → docker stop abc123
+- Container removed (--rm flag)
+- Patch written to preds.json for SWE-bench evaluation
+```
+
+### Summary Timeline
+
+```
+User runs command
+       │
+       ▼
+Load SWE-bench instance (problem + metadata)
+       │
+       ▼
+Build config (swebench.yaml + CLI args)
+       │
+       ▼
+┌──────────────────────────────────────────┐
+│  docker run ... sleep 2h                 │  ◄── Container starts
+│  (pre-built image with repo + deps)      │
+└──────────────────────────────────────────┘
+       │
+       ▼
+┌──────────────────────────────────────────┐
+│  AGENT LOOP                              │
+│  ┌────────────────────────────────────┐  │
+│  │ LLM: "I'll explore the codebase"   │  │
+│  │ docker exec: find /testbed ...     │  │
+│  └────────────────────────────────────┘  │
+│  ┌────────────────────────────────────┐  │
+│  │ LLM: "Let me read the file"        │  │
+│  │ docker exec: cat validators.py     │  │
+│  └────────────────────────────────────┘  │
+│  ┌────────────────────────────────────┐  │
+│  │ LLM: "I'll fix the regex"          │  │
+│  │ docker exec: sed -i 's/...'        │  │
+│  └────────────────────────────────────┘  │
+│  ┌────────────────────────────────────┐  │
+│  │ LLM: "Submitting the fix"          │  │
+│  │ docker exec: echo COMPLETE... &&   │  │
+│  │              cat patch.txt         │  │
+│  └────────────────────────────────────┘  │
+│                    │                     │
+│        _check_finished() sees magic      │
+│        raises Submitted(patch)           │
+└──────────────────────────────────────────┘
+       │
+       ▼
+Agent returns {exit_status, submission}
+       │
+       ▼
+┌──────────────────────────────────────────┐
+│  docker stop ...                         │  ◄── Container dies
+└──────────────────────────────────────────┘
+       │
+       ▼
+Patch saved to preds.json for evaluation
+```
+
+---
+
+## What is SWE-bench?
+
+### Overview
+
+**SWE-bench** (Software Engineering Bench) is a benchmark for evaluating AI systems on their ability to resolve **real-world GitHub issues**. Published at ICLR 2024 by the Princeton & Stanford team, it is the standard benchmark for measuring AI coding agent performance.
+
+**Core idea:** Given a codebase and a natural-language issue description, an AI system must produce a **patch** (code diff) that resolves the described problem. The patch is then verified by running the repository's **actual test suite**.
+
+### The 12 Repositories
+
+| Repository | Domain |
+|-----------|--------|
+| `django/django` | Web framework |
+| `sympy/sympy` | Symbolic mathematics |
+| `scikit-learn/scikit-learn` | Machine learning |
+| `matplotlib/matplotlib` | Data visualization |
+| `astropy/astropy` | Astronomy |
+| `psf/requests` | HTTP library |
+| `pallets/flask` | Web microframework |
+| `pytest-dev/pytest` | Testing framework |
+| `pydata/xarray` | Labeled arrays |
+| `pylint-dev/pylint` | Code linting |
+| `sphinx-doc/sphinx` | Documentation |
+| `mwaskom/seaborn` | Statistical visualization |
+
+All are popular, well-maintained Python projects with good test coverage.
+
+### What a SWE-bench Instance Contains
+
+Each instance is a JSON object representing a single resolved GitHub issue + PR:
+
+| Field | Description |
+|-------|-------------|
+| `instance_id` | e.g., `django__django-11099` |
+| `problem_statement` | The full issue description text |
+| `repo` | e.g., `django/django` |
+| `base_commit` | Exact commit hash before the fix |
+| `patch` | The gold-standard solution diff (hidden from agent) |
+| `test_patch` | Test changes from the PR |
+| `FAIL_TO_PASS` | Tests that must go from failing → passing |
+| `PASS_TO_PASS` | Tests that must continue passing (regression) |
+
+### How Evaluation Works
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  For each instance:                                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. Docker container with repo at base_commit                   │
+│     (before the fix was applied)                                │
+│                                                                 │
+│  2. Apply test_patch (adds/modifies test files)                 │
+│                                                                 │
+│  3. Apply model's generated patch                               │
+│                                                                 │
+│  4. Run test suite:                                             │
+│     - FAIL_TO_PASS tests: must now PASS  ◄── Proves fix works  │
+│     - PASS_TO_PASS tests: must still PASS ◄── No regressions   │
+│                                                                 │
+│  5. Score:                                                      │
+│     ✅ Resolved = ALL FAIL_TO_PASS pass AND ALL PASS_TO_PASS    │
+│     ❌ Not resolved = any test fails                             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+Primary metric:
+
+  Resolve Rate = (resolved instances / total instances) × 100%
+
+  e.g., "74% on SWE-bench Verified" means 370 of 500 instances fixed
+```
+
+### The Three Subsets
+
+| | Full | Lite | Verified |
+|---|------|------|----------|
+| **Instances** | 2,294 | 300 | 500 |
+| **Curation** | Automated | Subsampled | Human-validated |
+| **Difficulty labels** | No | No | Yes (easy/medium/hard) |
+| **Purpose** | Complete coverage | Cost-efficient eval | Most reliable signal |
+| **Status** | Original | Superseded | **Recommended** |
+
+- **Full**: The original 2,294 instances. Some are infeasible or have flawed tests.
+- **Lite**: 300 instances subsampled for cheaper evaluation. Largely superseded.
+- **Verified**: 500 instances reviewed by 93 professional developers. Removes problematic samples. The current standard for leaderboards.
+
+### Pre-built Docker Images
+
+SWE-bench provides a three-layer Docker image architecture:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 3: INSTANCE IMAGE  (one per task, ~2,294 total)         │
+│  - Repo checked out at exact base_commit                        │
+│  - test_patch applied                                           │
+│  - Ready to run                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│  Layer 2: ENVIRONMENT IMAGE  (~60 total)                       │
+│  - Correct Python version                                       │
+│  - All pip/conda dependencies installed                         │
+│  - Repository clone                                             │
+├─────────────────────────────────────────────────────────────────┤
+│  Layer 1: BASE IMAGE  (1 total)                                │
+│  - Ubuntu 22.04                                                 │
+│  - System packages + Miniconda                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Image naming in mini-swe-agent (`swebench.py:81-89`):
+
+```
+instance_id:  "django__django-11099"
+                     ↓
+docker image: "swebench/sweb.eval.x86_64.django_1776_django-11099:latest"
+              (double underscores replaced with _1776_ for Docker compatibility)
+```
+
+### How mini-swe-agent Connects to SWE-bench
+
+```
+┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│   SWE-bench      │     │  mini-swe-agent  │     │   SWE-bench      │
+│   Dataset        │────▶│  Agent           │────▶│   Evaluation     │
+│                  │     │                  │     │                  │
+│  problem_statement│     │  Reads problem   │     │  Applies patch   │
+│  base_commit     │     │  Runs in Docker  │     │  Runs tests      │
+│  Docker image    │     │  Produces patch  │     │  Scores result   │
+└──────────────────┘     └──────────────────┘     └──────────────────┘
+      INPUT                   AGENT                    SCORING
+```
+
+**mini-swe-agent's role**: Take the problem statement, work inside the Docker container, and produce a `git diff` patch. SWE-bench's evaluation harness then scores the patch separately.

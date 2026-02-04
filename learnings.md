@@ -1382,3 +1382,329 @@ docker image: "swebench/sweb.eval.x86_64.django_1776_django-11099:latest"
 ```
 
 **mini-swe-agent's role**: Take the problem statement, work inside the Docker container, and produce a `git diff` patch. SWE-bench's evaluation harness then scores the patch separately.
+
+---
+
+## How Models Work
+
+### What a Model Does
+
+The Model is the **translation layer** between the agent and the LLM API. It has four jobs:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          MODEL                                       │
+│                                                                      │
+│  1. QUERY        Send messages → LLM API → parse response            │
+│  2. PARSE        Extract bash commands from LLM's response           │
+│  3. FORMAT IN    Create properly structured messages for the API     │
+│  4. FORMAT OUT   Turn command output into messages the LLM can read  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Model Protocol
+
+From `__init__.py:42-57`, a Model must implement 5 methods:
+
+```python
+class Model(Protocol):
+    config: Any
+    def query(self, messages: list[dict]) -> dict: ...           # Call the LLM
+    def format_message(self, **kwargs) -> dict: ...              # Create a message dict
+    def format_observation_messages(self, ...) -> list[dict]: ...# Format command output
+    def get_template_vars(self, **kwargs) -> dict: ...           # Provide template vars
+    def serialize(self) -> dict: ...                             # For trajectory saving
+```
+
+---
+
+### The Two Approaches to Action Extraction
+
+This is the key architectural insight — there are **two fundamentally different ways** to extract bash commands from an LLM:
+
+#### Approach 1: Tool Calling (LitellmModel) — Recommended
+
+The LLM uses OpenAI-style function calling. The API natively returns structured tool calls.
+
+```
+Agent sends to LLM:
+  messages: [...],
+  tools: [{name: "bash", parameters: {command: string}}]
+                    │
+                    ▼
+LLM API returns structured tool_calls:
+  {
+    "role": "assistant",
+    "content": "I'll look at the file",
+    "tool_calls": [
+      {
+        "id": "call_abc123",
+        "function": {
+          "name": "bash",
+          "arguments": "{\"command\": \"cat file.py\"}"
+        }
+      }
+    ]
+  }
+                    │
+                    ▼
+parse_toolcall_actions() extracts:
+  [{"command": "cat file.py", "tool_call_id": "call_abc123"}]
+```
+
+**Observation format:** Results go back as `role: "tool"` messages with matching `tool_call_id`:
+
+```python
+{"role": "tool", "tool_call_id": "call_abc123", "content": "<output>...</output>"}
+```
+
+#### Approach 2: Text/Regex-based (LitellmTextbasedModel) — Legacy
+
+The LLM writes commands in markdown code blocks. A regex extracts them.
+
+```
+Agent sends to LLM:
+  messages: [...],
+  NO tools parameter
+                    │
+                    ▼
+LLM returns plain text:
+  "THOUGHT: I need to look at the file.
+
+  ```mswea_bash_command
+  cat file.py
+  ```"
+                    │
+                    ▼
+parse_regex_actions() with r"```mswea_bash_command\s*\n(.*?)\n```":
+  [{"command": "cat file.py"}]    ◄── No tool_call_id
+```
+
+**Observation format:** Results go back as `role: "user"` messages (no tool_call_id to match):
+
+```python
+{"role": "user", "content": "<output>...</output>"}
+```
+
+#### Comparison
+
+| Aspect | Tool Calling (v2) | Text/Regex (v1) |
+|--------|-------------------|-----------------|
+| Extraction | Structured API response | Regex on markdown |
+| Reliability | High (native parsing) | Fragile (LLM must format correctly) |
+| Error handling | API-level validation | FormatError if != 1 match |
+| Observation format | `role: "tool"` with ID | `role: "user"` |
+| Models supported | Most modern LLMs | Any LLM (including local) |
+
+---
+
+### LitellmModel Deep Dive
+
+File: `litellm_model.py:48-147`
+
+#### The `query()` Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  query(messages)                                                     │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  1. PREPARE messages for API                                         │
+│     • Strip "extra" keys (internal metadata, not for API)            │
+│     • Reorder Anthropic thinking blocks                              │
+│     • Set cache control markers (for Anthropic)                      │
+│                                                                      │
+│  2. CALL LLM with retry                                              │
+│     litellm.completion(                                              │
+│         model="anthropic/claude-sonnet-4-5-20250929",                │
+│         messages=prepared,                                           │
+│         tools=[BASH_TOOL],   ◄── Only one tool: bash                │
+│         **model_kwargs                                               │
+│     )                                                                │
+│     Retries up to 10x with exponential backoff (4s, 8s, 16s...)     │
+│     Aborts immediately on: auth error, context overflow,             │
+│       not found, permission denied                                   │
+│                                                                      │
+│  3. CALCULATE COST                                                   │
+│     cost = litellm.cost_calculator.completion_cost(response)         │
+│     GLOBAL_MODEL_STATS.add(cost)  ◄── Thread-safe global tracker    │
+│                                                                      │
+│  4. PARSE ACTIONS                                                    │
+│     tool_calls = response.choices[0].message.tool_calls              │
+│     Validates:                                                       │
+│       • At least one tool call exists                                │
+│       • Tool name is "bash"                                          │
+│       • Arguments contain "command" key                              │
+│       • JSON parses correctly                                        │
+│     If any fail → raises FormatError (LLM retries)                   │
+│                                                                      │
+│  5. BUILD RETURN MESSAGE                                             │
+│     return {                                                         │
+│       "role": "assistant",                                           │
+│       "content": "I'll look at the file",                            │
+│       "tool_calls": [...],                                           │
+│       "extra": {                                                     │
+│         "actions": [{"command":"cat f.py","tool_call_id":"abc"}],    │
+│         "cost": 0.003,                                               │
+│         "response": {...},  ◄── Full API response for trajectory     │
+│         "timestamp": 1706...                                         │
+│       }                                                              │
+│     }                                                                │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### Message Preparation (`_prepare_messages_for_api`)
+
+Before sending to the API, messages are cleaned up:
+
+```python
+# 1. Strip internal "extra" metadata
+prepared = [{k: v for k, v in msg.items() if k != "extra"} for msg in messages]
+
+# 2. Reorder Anthropic thinking blocks (model-specific quirk)
+prepared = _reorder_anthropic_thinking_blocks(prepared)
+
+# 3. Set cache control markers (Anthropic cost optimization)
+prepared = set_cache_control(prepared, mode=self.config.set_cache_control)
+```
+
+#### Observation Formatting
+
+When the environment returns command output, the model formats it for the LLM:
+
+```
+env.execute() returns:
+  {"output": "hello world", "returncode": 0, "exception_info": ""}
+                    │
+                    ▼
+Renders observation_template (Jinja2):
+  <returncode>0</returncode>
+  <output>
+  hello world
+  </output>
+                    │
+                    ▼
+Returns message:
+  {
+    "role": "tool",
+    "tool_call_id": "call_abc123",       ◄── Links back to tool call
+    "content": "<returncode>0</returncode>\n<output>\nhello world\n</output>",
+    "extra": {"raw_output": "hello world", "returncode": 0, ...}
+  }
+```
+
+For long outputs (>10,000 chars), the SWE-bench config truncates to head+tail with a warning.
+
+---
+
+### Error Handling: Self-Correcting Loop
+
+When the LLM produces invalid output, the model raises `FormatError`:
+
+```
+LLM response has no tool calls (or invalid tool name, bad JSON, etc.)
+        │
+        ▼
+parse_toolcall_actions() raises FormatError({
+    "role": "user",
+    "content": "No tool calls found. Every response MUST include at least one tool call."
+})
+        │
+        ▼
+Agent catches InterruptAgentFlow
+  → Adds error message to message history
+  → Loop continues → next query()
+  → LLM sees the error message and corrects its output
+```
+
+This means the agent **automatically recovers** from format mistakes.
+
+---
+
+### Available Model Classes
+
+| Class | How it extracts actions | Use case |
+|-------|------------------------|----------|
+| `LitellmModel` | API tool calls | **Default**, most reliable |
+| `LitellmTextbasedModel` | Regex on `` ```mswea_bash_command `` blocks | Legacy v1, local models |
+| `LitellmResponseModel` | OpenAI Responses API format | Newer OpenAI API |
+| `OpenRouterModel` | Tool calls via OpenRouter | OpenRouter routing |
+| `PortkeyModel` | Tool calls via Portkey | Portkey gateway |
+| `RequestyModel` | Tool calls via Requesty | Requesty gateway |
+| `DeterministicModel` | Pre-defined output sequence | Testing only |
+
+All real models route through **LiteLLM**, which normalizes 100+ LLM provider APIs into one interface.
+
+---
+
+### Model Selection Logic
+
+File: `models/__init__.py:45-113`
+
+```
+get_model(config) resolution order:
+
+  1. model_name from:
+     CLI arg → config file → MSWEA_MODEL_NAME env var
+
+  2. model_class from:
+     config → default to LitellmModel
+
+  3. Auto-detect Anthropic models:
+     If name contains "anthropic/claude/sonnet/opus"
+     → enable cache_control="default_end" (saves money)
+
+  4. Return model_class(**config)
+```
+
+---
+
+### Cache Control (Anthropic Cost Optimization)
+
+File: `cache_control.py:49-67`
+
+For Anthropic models, the system sets `cache_control: {type: "ephemeral"}` on the **last message**. This tells the API to cache everything before that point, so on the next query only the new content is billed at full input price.
+
+```
+Messages: [system, user, assistant, tool, assistant, tool]
+                                                      ↑
+                                          cache_control: ephemeral
+
+Next query: everything before the marker is cached → cheaper
+```
+
+---
+
+### Global Cost Tracking
+
+File: `models/__init__.py:13-42`
+
+A thread-safe `GlobalModelStats` singleton tracks costs across all model instances:
+
+```python
+GLOBAL_MODEL_STATS = GlobalModelStats()
+```
+
+- Tracks total cost and call count
+- Enforced via `MSWEA_GLOBAL_COST_LIMIT` and `MSWEA_GLOBAL_CALL_LIMIT` env vars
+- Thread-safe with locking (for parallel batch runs with multiple workers)
+- Raises `RuntimeError` if limit exceeded
+
+---
+
+### LitellmModelConfig Options
+
+File: `litellm_model.py:26-46`
+
+```python
+class LitellmModelConfig(BaseModel):
+    model_name: str                     # e.g., "anthropic/claude-sonnet-4-5-20250929"
+    model_kwargs: dict = {}             # Extra API args (temperature, etc.)
+    litellm_model_registry: Path = None # Custom cost info for local models
+    set_cache_control: str = None       # "default_end" for Anthropic
+    cost_tracking: str = "default"      # or "ignore_errors" for local models
+    format_error_template: str = ...    # Error message when LLM formats badly
+    observation_template: str = ...     # Jinja2 template for command output
+    multimodal_regex: str = ""          # For image/screenshot support
+```

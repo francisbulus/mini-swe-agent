@@ -1,4 +1,4 @@
-# mini-swe-agent Codebase Learnings
+# mini-swe-agent Codebase Learnings Extracted From Claude Code
 
 ## Overview
 
@@ -707,13 +707,13 @@ And gets back:
 
 This separation is powerful because:
 
-| Concern | Agent's Job | Environment's Job |
-|---------|-------------|-------------------|
-| **What** to run | ✅ Decides commands | ❌ Doesn't care |
-| **Where** it runs | ❌ Doesn't care | ✅ Handles execution |
-| **How** it runs | ❌ Doesn't care | ✅ subprocess, docker exec, etc. |
-| **Isolation** | ❌ Doesn't care | ✅ Sandboxing, permissions |
-| **Cleanup** | ❌ Doesn't care | ✅ Container lifecycle |
+| Concern           | Agent's Job         | Environment's Job                |
+| ----------------- | ------------------- | -------------------------------- |
+| **What** to run   | ✅ Decides commands | ❌ Doesn't care                  |
+| **Where** it runs | ❌ Doesn't care     | ✅ Handles execution             |
+| **How** it runs   | ❌ Doesn't care     | ✅ subprocess, docker exec, etc. |
+| **Isolation**     | ❌ Doesn't care     | ✅ Sandboxing, permissions       |
+| **Cleanup**       | ❌ Doesn't care     | ✅ Container lifecycle           |
 
 ### Why Environments Matter
 
@@ -806,6 +806,7 @@ From `local.py:23-53`:
 ```
 
 **Key characteristics:**
+
 - Executes directly on host machine via `subprocess.run`
 - Shell mode enabled (`shell=True`)
 - Merges custom env vars with `os.environ`
@@ -851,6 +852,7 @@ From `docker.py:45-138`:
 ```
 
 **Key differences from Local:**
+
 - Starts a long-running container on init
 - Commands run via `docker exec` instead of direct subprocess
 - Automatic cleanup when environment is garbage collected
@@ -957,13 +959,13 @@ All of these are **graceful exits** — they add messages to history and can tri
 
 Both environments provide context via `get_template_vars()`:
 
-| Variable | Source | Example |
-|----------|--------|---------|
-| `cwd` | Config | `/home/user/project` |
-| `timeout` | Config | `30` |
-| `system` | `platform.uname()` | `Darwin` |
-| `node` | `platform.uname()` | `MacBook-Pro.local` |
-| `PATH` | `os.environ` | `/usr/bin:/bin:...` |
+| Variable  | Source             | Example              |
+| --------- | ------------------ | -------------------- |
+| `cwd`     | Config             | `/home/user/project` |
+| `timeout` | Config             | `30`                 |
+| `system`  | `platform.uname()` | `Darwin`             |
+| `node`    | `platform.uname()` | `MacBook-Pro.local`  |
+| `PATH`    | `os.environ`       | `/usr/bin:/bin:...`  |
 
 These are available in Jinja2 templates (system prompt, etc.).
 
@@ -971,13 +973,13 @@ These are available in Jinja2 templates (system prompt, etc.).
 
 ### Environment Comparison
 
-| Aspect | LocalEnvironment | DockerEnvironment |
-|--------|------------------|-------------------|
+| Aspect    | LocalEnvironment        | DockerEnvironment            |
+| --------- | ----------------------- | ---------------------------- |
 | Execution | Direct `subprocess.run` | `docker exec` into container |
-| Isolation | None (host machine) | Full container sandbox |
-| Startup | Instant | Container creation time |
-| Cleanup | None needed | Stops/removes container |
-| Use case | Development/trusted | SWE-bench/untrusted code |
+| Isolation | None (host machine)     | Full container sandbox       |
+| Startup   | Instant                 | Container creation time      |
+| Cleanup   | None needed             | Stops/removes container      |
+| Use case  | Development/trusted     | SWE-bench/untrusted code     |
 
 The protocol design means you can swap `LocalEnvironment` for `DockerEnvironment` with zero code changes — just different config.
 
@@ -1041,12 +1043,12 @@ Loads and merges `swebench.yaml` + CLI overrides:
 agent:
   system_template: "You are a helpful assistant..."
   instance_template: "<pr_description>{{task}}</pr_description>..."
-  step_limit: 250       # Max 250 LLM calls
-  cost_limit: 3.0       # Max $3 per instance
+  step_limit: 250 # Max 250 LLM calls
+  cost_limit: 3.0 # Max $3 per instance
 
 environment:
-  environment_class: docker   # ◄── Key: use Docker
-  cwd: "/testbed"             # ◄── Working dir inside container
+  environment_class: docker # ◄── Key: use Docker
+  cwd: "/testbed" # ◄── Working dir inside container
   timeout: 60
 
 model:
@@ -1259,20 +1261,20 @@ Patch saved to preds.json for evaluation
 
 ### The 12 Repositories
 
-| Repository | Domain |
-|-----------|--------|
-| `django/django` | Web framework |
-| `sympy/sympy` | Symbolic mathematics |
-| `scikit-learn/scikit-learn` | Machine learning |
-| `matplotlib/matplotlib` | Data visualization |
-| `astropy/astropy` | Astronomy |
-| `psf/requests` | HTTP library |
-| `pallets/flask` | Web microframework |
-| `pytest-dev/pytest` | Testing framework |
-| `pydata/xarray` | Labeled arrays |
-| `pylint-dev/pylint` | Code linting |
-| `sphinx-doc/sphinx` | Documentation |
-| `mwaskom/seaborn` | Statistical visualization |
+| Repository                  | Domain                    |
+| --------------------------- | ------------------------- |
+| `django/django`             | Web framework             |
+| `sympy/sympy`               | Symbolic mathematics      |
+| `scikit-learn/scikit-learn` | Machine learning          |
+| `matplotlib/matplotlib`     | Data visualization        |
+| `astropy/astropy`           | Astronomy                 |
+| `psf/requests`              | HTTP library              |
+| `pallets/flask`             | Web microframework        |
+| `pytest-dev/pytest`         | Testing framework         |
+| `pydata/xarray`             | Labeled arrays            |
+| `pylint-dev/pylint`         | Code linting              |
+| `sphinx-doc/sphinx`         | Documentation             |
+| `mwaskom/seaborn`           | Statistical visualization |
 
 All are popular, well-maintained Python projects with good test coverage.
 
@@ -1280,16 +1282,16 @@ All are popular, well-maintained Python projects with good test coverage.
 
 Each instance is a JSON object representing a single resolved GitHub issue + PR:
 
-| Field | Description |
-|-------|-------------|
-| `instance_id` | e.g., `django__django-11099` |
-| `problem_statement` | The full issue description text |
-| `repo` | e.g., `django/django` |
-| `base_commit` | Exact commit hash before the fix |
-| `patch` | The gold-standard solution diff (hidden from agent) |
-| `test_patch` | Test changes from the PR |
-| `FAIL_TO_PASS` | Tests that must go from failing → passing |
-| `PASS_TO_PASS` | Tests that must continue passing (regression) |
+| Field               | Description                                         |
+| ------------------- | --------------------------------------------------- |
+| `instance_id`       | e.g., `django__django-11099`                        |
+| `problem_statement` | The full issue description text                     |
+| `repo`              | e.g., `django/django`                               |
+| `base_commit`       | Exact commit hash before the fix                    |
+| `patch`             | The gold-standard solution diff (hidden from agent) |
+| `test_patch`        | Test changes from the PR                            |
+| `FAIL_TO_PASS`      | Tests that must go from failing → passing           |
+| `PASS_TO_PASS`      | Tests that must continue passing (regression)       |
 
 ### How Evaluation Works
 
@@ -1324,13 +1326,13 @@ Primary metric:
 
 ### The Three Subsets
 
-| | Full | Lite | Verified |
-|---|------|------|----------|
-| **Instances** | 2,294 | 300 | 500 |
-| **Curation** | Automated | Subsampled | Human-validated |
-| **Difficulty labels** | No | No | Yes (easy/medium/hard) |
-| **Purpose** | Complete coverage | Cost-efficient eval | Most reliable signal |
-| **Status** | Original | Superseded | **Recommended** |
+|                       | Full              | Lite                | Verified               |
+| --------------------- | ----------------- | ------------------- | ---------------------- |
+| **Instances**         | 2,294             | 300                 | 500                    |
+| **Curation**          | Automated         | Subsampled          | Human-validated        |
+| **Difficulty labels** | No                | No                  | Yes (easy/medium/hard) |
+| **Purpose**           | Complete coverage | Cost-efficient eval | Most reliable signal   |
+| **Status**            | Original          | Superseded          | **Recommended**        |
 
 - **Full**: The original 2,294 instances. Some are infeasible or have flawed tests.
 - **Lite**: 300 instances subsampled for cheaper evaluation. Largely superseded.
@@ -1462,7 +1464,7 @@ parse_toolcall_actions() extracts:
 
 The LLM writes commands in markdown code blocks. A regex extracts them.
 
-```
+````
 Agent sends to LLM:
   messages: [...],
   NO tools parameter
@@ -1478,7 +1480,7 @@ LLM returns plain text:
                     ▼
 parse_regex_actions() with r"```mswea_bash_command\s*\n(.*?)\n```":
   [{"command": "cat file.py"}]    ◄── No tool_call_id
-```
+````
 
 **Observation format:** Results go back as `role: "user"` messages (no tool_call_id to match):
 
@@ -1488,13 +1490,13 @@ parse_regex_actions() with r"```mswea_bash_command\s*\n(.*?)\n```":
 
 #### Comparison
 
-| Aspect | Tool Calling (v2) | Text/Regex (v1) |
-|--------|-------------------|-----------------|
-| Extraction | Structured API response | Regex on markdown |
-| Reliability | High (native parsing) | Fragile (LLM must format correctly) |
-| Error handling | API-level validation | FormatError if != 1 match |
-| Observation format | `role: "tool"` with ID | `role: "user"` |
-| Models supported | Most modern LLMs | Any LLM (including local) |
+| Aspect             | Tool Calling (v2)       | Text/Regex (v1)                     |
+| ------------------ | ----------------------- | ----------------------------------- |
+| Extraction         | Structured API response | Regex on markdown                   |
+| Reliability        | High (native parsing)   | Fragile (LLM must format correctly) |
+| Error handling     | API-level validation    | FormatError if != 1 match           |
+| Observation format | `role: "tool"` with ID  | `role: "user"`                      |
+| Models supported   | Most modern LLMs        | Any LLM (including local)           |
 
 ---
 
@@ -1624,15 +1626,15 @@ This means the agent **automatically recovers** from format mistakes.
 
 ### Available Model Classes
 
-| Class | How it extracts actions | Use case |
-|-------|------------------------|----------|
-| `LitellmModel` | API tool calls | **Default**, most reliable |
-| `LitellmTextbasedModel` | Regex on `` ```mswea_bash_command `` blocks | Legacy v1, local models |
-| `LitellmResponseModel` | OpenAI Responses API format | Newer OpenAI API |
-| `OpenRouterModel` | Tool calls via OpenRouter | OpenRouter routing |
-| `PortkeyModel` | Tool calls via Portkey | Portkey gateway |
-| `RequestyModel` | Tool calls via Requesty | Requesty gateway |
-| `DeterministicModel` | Pre-defined output sequence | Testing only |
+| Class                   | How it extracts actions                   | Use case                   |
+| ----------------------- | ----------------------------------------- | -------------------------- |
+| `LitellmModel`          | API tool calls                            | **Default**, most reliable |
+| `LitellmTextbasedModel` | Regex on ` ```mswea_bash_command ` blocks | Legacy v1, local models    |
+| `LitellmResponseModel`  | OpenAI Responses API format               | Newer OpenAI API           |
+| `OpenRouterModel`       | Tool calls via OpenRouter                 | OpenRouter routing         |
+| `PortkeyModel`          | Tool calls via Portkey                    | Portkey gateway            |
+| `RequestyModel`         | Tool calls via Requesty                   | Requesty gateway           |
+| `DeterministicModel`    | Pre-defined output sequence               | Testing only               |
 
 All real models route through **LiteLLM**, which normalizes 100+ LLM provider APIs into one interface.
 
